@@ -1,1 +1,124 @@
+# Enterprise Network Infrastructure
 
+A redundant enterprise network I designed and built in Cisco Packet Tracer. It covers VLAN segmentation, inter-VLAN routing, HSRP, OSPF, EtherChannel, Rapid PVST+, DHCP, ACLs, and SSH management — basically the core stuff you'd expect to see holding together a mid-size company's network.
+
+## Overview
+
+The lab simulates a company network with a few departments, a server farm, printers, access switches, two multilayer switches, and a router. I wanted to go beyond just "VLANs work" and actually build something that could survive a link or device going down, since that's the part a lot of practice labs skip.
+
+Main things I was going for:
+
+- Clean segmentation between departments
+- No single point of failure at Layer 2 or Layer 3
+- Dynamic routing instead of static routes everywhere
+- Centralized DHCP and controlled inter-department traffic
+- Secure management access (no Telnet)
+- Actually breaking things on purpose to see if the redundancy held up
+
+Everything below was built and tested in Cisco Packet Tracer.
+
+## VLAN Design
+
+| VLAN | Name       | Purpose                  | Network          |
+|-----:|------------|--------------------------|------------------|
+| 10   | IT         | IT Department            | 10.10.10.0/27    |
+| 20   | HR         | Human Resources          | 10.10.20.0/28    |
+| 30   | ACCOUNTING | Accounting Department    | 10.10.30.0/27    |
+| 40   | SERVER     | Server Network           | 10.10.40.0/28    |
+| 99   | MANAGEMENT | Network Management       | 10.10.99.0/28    |
+| 999  | NATIVE     | Native VLAN              | N/A              |
+
+Trunk links carry the VLANs they need to, and I moved the native VLAN off of 1 as a basic hardening step.
+
+## Inter-VLAN Routing
+
+Both multilayer switches act as Layer 3 gateways using SVIs, one per VLAN on each switch.
+
+| VLAN | MSW1 SVI    | MSW2 SVI    | HSRP Virtual IP  |
+|-----:|-------------|-------------|------------------|
+| 10   | 10.10.10.1  | 10.10.10.2  | 10.10.10.3       |
+| 20   | 10.10.20.1  | 10.10.20.2  | 10.10.20.3       |
+| 30   | 10.10.30.1  | 10.10.30.2  | 10.10.30.3       |
+| 40   | 10.10.40.1  | 10.10.40.2  | 10.10.40.3       |
+| 99   | 10.10.99.1  | 10.10.99.2  | 10.10.99.3       |
+
+Hosts point at the HSRP virtual IP, not either switch directly.
+
+## HSRP
+
+I split the active gateway role across both switches instead of parking everything on one:
+
+- MSW1 is active for VLANs 10, 30, and 99
+- MSW2 is active for VLANs 20 and 40
+
+**Failover test:** shut down the VLAN 10 SVI on MSW1. MSW2 took over the active role for 10.10.10.3 and IT-to-HR traffic kept flowing without hosts needing to do anything. Passed.
+
+## EtherChannel
+
+LACP EtherChannel between the two multilayer switches:
+
+- MSW1: Gi1/0/23–24
+- MSW2: Gi1/0/23–24
+- Port-channel1, LACP active mode
+
+**Failure test:** shut down MSW1 Gi1/0/23. The other member link kept carrying traffic with no interruption. Passed.
+
+## Rapid PVST+
+
+Used to stop Layer 2 loops and converge fast when a link drops. PortFast and BPDU Guard are on for edge ports.
+
+**Failure test:** shut down one uplink from the IT access switch. STP recalculated and the backup uplink took over the forwarding role. Passed.
+
+## OSPF
+
+OSPF runs between the router and both multilayer switches, with neighbors reaching FULL state and redundant paths toward the core.
+
+**Failure test:** shut down the router's link to MSW1. OSPF pulled the route and rerouted through MSW2 instead. Inter-VLAN traffic kept working after reconvergence. Passed.
+
+## DHCP
+
+Centralized DHCP hands out IP, subnet mask, and default gateway to hosts in the relevant VLANs. Tested with multiple hosts pulling addresses on boot.
+
+## Access Control Lists
+
+Extended ACLs block HR and Accounting from talking to each other directly, while everything else stays permitted:
+
+```
+HR → Accounting     DENY
+Accounting → HR     DENY
+Everything else     PERMIT
+```
+
+Verified with inter-VLAN connectivity tests after applying the ACLs.
+
+## SSH Management
+
+SSH is enabled on both multilayer switches, the router, and the access switches, with Telnet turned off. I also confirmed the router is reachable over SSH via its OSPF-advertised loopback, not just a directly connected interface.
+
+## Failover Testing Summary
+
+| Test         | Failure simulated          | Result |
+|--------------|----------------------------|--------|
+| HSRP         | MSW1 VLAN 10 SVI down      | Pass   |
+| EtherChannel | MSW1 Gi1/0/23 down         | Pass   |
+| OSPF         | R1 G0/0/0 down             | Pass   |
+| Rapid PVST+  | IT-SW Gi0/1 down           | Pass   |
+
+## Technologies Used
+
+Cisco Packet Tracer, VLANs, 802.1Q trunking, inter-VLAN routing, HSRP, OSPF, EtherChannel/LACP, Rapid PVST+, DHCP, extended ACLs, SSH, port security, IPv4 subnetting.
+
+## What I Took Away From This
+
+The biggest thing I learned wasn't any single protocol — it was how they depend on each other. HSRP handles gateway failure, EtherChannel handles link failure, STP keeps Layer 2 loop-free while still giving you a backup path, and OSPF handles routing failure. None of them do much on their own; the network only actually holds up because they're layered together.
+
+The failure tests mattered more than the initial configs, honestly. It's easy to set up HSRP or OSPF and assume it's working because there are no errors on screen. Actually shutting down an interface and watching traffic reroute is what proved it.
+
+## Author
+
+Mark Clarence L. Abanid
+Computer Engineering Student, Philippines
+
+## Status
+
+Completed and tested.
