@@ -1,0 +1,183 @@
+# Network Design Documentation
+
+## 1. Introduction
+
+This document walks through the design decisions behind an enterprise network I built in Cisco Packet Tracer. It simulates a small company with a few departments, centralized servers, dedicated network management, and redundant paths at both Layer 2 and Layer 3.
+
+The goal wasn't just to get things connected — it was to make sure the network could keep running when a link or device failed, while still being organized, secure, and reasonably easy to scale.
+
+## 2. Network Architecture
+
+The network follows a fairly standard hierarchical layout: a router, two multilayer core switches, several access switches, departmental end devices, a small server farm, and a printer.
+
+The two multilayer switches do the heavy lifting for Layer 3 — inter-VLAN routing, HSRP, OSPF, DHCP, and ACL enforcement all live there. The access switches just handle Layer 2 connectivity for end devices; they don't need to know about routing at all.
+
+## 3. Topology
+
+Screenshot/Topology.png
+
+The two multilayer switches give the network redundant paths between the access layer and the routing core, and important infrastructure links are doubled up wherever it made sense, so losing one link or device doesn't take the whole segment down with it.
+
+## 4. Device Roles
+
+| Device        | Role                                   
+|---------------|----------------------------------------|
+| R1            | WAN/core router, OSPF router           |
+| MSW1          | Multilayer core switch 1               |
+| MSW2          | Multilayer core switch 2               |
+| IT-SW         | IT department access switch            |
+| HR-SW         | HR department access switch            |
+| Accounting-SW | Accounting department access switch    |
+| Server-SW     | Server access switch                   |
+
+**R1** handles the Layer 3 routing connection into the multilayer switching infrastructure and runs OSPF. It also has a loopback interface advertised through OSPF, mainly so there's a stable address for management even if a physical interface goes down.
+
+**MSW1 and MSW2** are the workhorses — VLAN gateways, inter-VLAN routing, HSRP, OSPF, DHCP, ACLs, and the EtherChannel link between them all live here.
+
+**The access switches** just connect end devices to their VLANs and switch traffic at Layer 2.
+
+## 5. VLAN Design
+
+| VLAN | Name       | Purpose                       |
+|-----:|------------|-------------------------------|
+| 10   | IT         | IT department                 |
+| 20   | HR         | Human Resources               |
+| 30   | ACCOUNTING | Accounting department         |
+| 40   | SERVER     | Server infrastructure         |
+| 99   | MANAGEMENT | Network device management     |
+| 999  | NATIVE     | Native VLAN for trunk links   |
+
+Splitting departments into their own VLANs keeps broadcast traffic contained and makes the network easier to reason about — HR traffic has no reason to be visible on the Accounting segment, for example.
+
+## 6. IP Addressing
+
+Everything internal uses private IPv4 space, sized per VLAN based on how many devices actually need to fit:
+
+| VLAN | Network      | Prefix |
+|-----:|--------------|-------:|
+| 10   | 10.10.10.0   | /27    |
+| 20   | 10.10.20.0   | /28    |
+| 30   | 10.10.30.0   | /27    |
+| 40   | 10.10.40.0   | /28    |
+| 99   | 10.10.99.0   | /28    |
+
+IT and Accounting got the bigger /27 blocks since they have more end devices; HR, the server VLAN, and management got /28s.
+
+## 7. Default Gateway Design
+
+Every VLAN gets two physical gateway addresses — one on each multilayer switch — plus a shared HSRP virtual address that end devices actually point to:
+
+| VLAN | MSW1        | MSW2        | HSRP Virtual Gateway |
+|-----:|-------------|-------------|----------------------|
+| 10   | 10.10.10.1  | 10.10.10.2  | 10.10.10.3           |
+| 20   | 10.10.20.1  | 10.10.20.2  | 10.10.20.3           |
+| 30   | 10.10.30.1  | 10.10.30.2  | 10.10.30.3           |
+| 40   | 10.10.40.1  | 10.10.40.2  | 10.10.40.3           |
+| 99   | 10.10.99.1  | 10.10.99.2  | 10.10.99.3           |
+
+So an IT workstation's default gateway is just `10.10.10.3` — it never has to know or care which physical switch is actually answering for that address at any given moment.
+
+## 8. HSRP Design
+
+To avoid dumping the entire gateway workload on one switch, I split the active role between the two:
+
+**MSW1** is active for VLANs 10, 30, and 99.
+**MSW2** is active for VLANs 20 and 40.
+
+This spreads the load a bit and still gives full redundancy — if either switch goes down, its VLANs fail over to the other one, and the virtual gateway address doesn't change from the host's perspective.
+
+## 9. Inter-VLAN Routing
+
+Inter-VLAN routing happens through SVIs configured on both multilayer switches for every VLAN. For VLAN 10, that looks like:
+
+```
+MSW1 → 10.10.10.1
+MSW2 → 10.10.10.2
+HSRP → 10.10.10.3
+```
+
+So when IT (VLAN 10) needs to reach HR (VLAN 20), traffic goes up to the multilayer switch layer and gets routed across — same pattern for any other VLAN pair.
+
+## 10. OSPF Design
+
+OSPF handles dynamic routing on the Layer 3 side, running between R1 and both multilayer switches.
+
+R1 also advertises a loopback (`1.1.1.1`) into OSPF, which gives it a stable address for management that doesn't depend on any single physical interface staying up.
+
+Because there are redundant paths between R1 and the multilayer switches, OSPF can pick an alternate route automatically if one link drops — no manual intervention needed.
+
+## 11. EtherChannel Design
+
+MSW1 and MSW2 are connected through an LACP EtherChannel bundling two physical links each:
+
+```
+MSW1: Gi1/0/23, Gi1/0/24
+MSW2: Gi1/0/23, Gi1/0/24
+→ Port-channel1
+```
+
+Configured with `channel-group 1 mode active`. Bundling the links this way gives more aggregate bandwidth between the core switches and means losing one physical link doesn't take the whole trunk down — the channel just keeps running on the remaining member.
+
+## 12. Trunking
+
+802.1Q trunks carry VLAN traffic between the access and multilayer layers, with VLAN 999 set as the native VLAN (deliberately unused for actual traffic — just a habit worth keeping for security). VLANs 10, 20, 30, 40, 99, and 999 all ride the trunk infrastructure.
+
+## 13. Rapid PVST+
+
+Rapid PVST+ prevents Layer 2 loops while still allowing redundant physical paths to exist — each VLAN gets its own spanning-tree instance, so the forwarding topology can differ per VLAN if needed. PortFast and BPDU Guard are enabled on edge-facing ports by default.
+
+## 14. DHCP Design
+
+DHCP hands out IP addresses, subnet masks, and default gateways automatically, so nobody's manually configuring IPs on every workstation. Tested with several clients pulling addresses on boot to confirm scopes were working correctly.
+
+## 15. ACL Design
+
+Extended ACLs restrict direct communication between HR and Accounting in both directions:
+
+```
+HR → Accounting     DENY
+Accounting → HR     DENY
+```
+
+Everything else is permitted under the existing ACL rules. Verified with inter-VLAN ping tests after applying the ACLs to make sure legitimate traffic wasn't accidentally caught in the deny rules.
+
+## 16. SSH Management
+
+SSH is configured on the multilayer switches, router, and applicable access switches for encrypted remote management — no Telnet anywhere on the network. The router is also reachable over SSH via its OSPF-advertised loopback, which was worth confirming since it proves the loopback is actually useful for management, not just present on paper.
+
+## 17. Network Redundancy
+
+Redundancy shows up at every layer rather than just one:
+
+- **Gateway redundancy** — HSRP
+- **Link redundancy** — EtherChannel
+- **Layer 2 path redundancy** — Rapid PVST+
+- **Layer 3 routing redundancy** — OSPF
+
+Stacking these together means the network can absorb a link or gateway failure at almost any point without a full outage.
+
+## 18. Failover Testing
+
+Each redundancy mechanism was tested by deliberately breaking something and watching what happened.
+
+**HSRP** — Shut down the VLAN 10 SVI on MSW1. MSW2 took over as the active gateway and connectivity held. **Pass.**
+
+**EtherChannel** — Shut down MSW1 Gi1/0/23. The remaining member link kept forwarding traffic without interruption. **Pass.**
+
+**OSPF** — Shut down R1's Gi0/0/0 link toward MSW1. OSPF pulled the dead route and rerouted traffic through the surviving path. **Pass.**
+
+**Rapid PVST+** — Shut down the IT access switch's primary uplink (SW1 Gi0/1). Spanning tree brought up the alternate uplink (SW1 Gi0/2) and connectivity stayed up. **Pass.**
+
+## 19. Design Summary
+
+Put together, the network delivers departmental VLAN segmentation, inter-VLAN routing, redundant gateways, dynamic routing, redundant physical links, loop prevention, automatic addressing, traffic filtering, secure management, and — critically — failover behavior that's actually been tested rather than assumed.
+
+The bigger takeaway is that none of these technologies matter much in isolation. The value comes from how they layer together into something that behaves like a real, resilient network rather than a checklist of configured features.
+
+## 20. Conclusion
+
+Building this gave me hands-on practice designing, configuring, troubleshooting, and validating an enterprise-style network end to end.
+
+The part that mattered most wasn't getting the configs right the first time — it was deliberately breaking things afterward to see if the redundancy actually held up. HSRP, EtherChannel, OSPF, and Rapid PVST+ were all pushed through simulated failures, and in every case the network kept routing traffic through an alternate path instead of going down.
+
+That's really the core lesson: segmentation, redundancy, and dynamic routing only mean something once you've actually verified them under failure, not just configured them and moved on.
