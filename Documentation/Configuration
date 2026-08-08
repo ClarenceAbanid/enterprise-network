@@ -1,0 +1,439 @@
+# Network Configuration Documentation
+
+This is the actual Cisco IOS configuration behind the enterprise network project — the commands I ran to build each piece, plus notes on why.
+
+> IPs and interface numbers below match the final topology. If you're adapting this for your own lab, your interface numbering will probably be different depending on the devices you're using.
+
+---
+
+## 1. VLANs
+
+Created one VLAN per department plus a couple for infrastructure:
+
+```cisco
+vlan 10
+ name IT
+
+vlan 20
+ name HR
+
+vlan 30
+ name ACCOUNTING
+
+vlan 40
+ name SERVER
+
+vlan 99
+ name MANAGEMENT
+
+vlan 999
+ name NATIVE
+```
+
+## 2. Access Ports
+
+End-device ports get assigned to their VLAN with PortFast on, since these are edge ports and there's no reason to wait through the normal STP listening/learning delay:
+
+```cisco
+interface fa0/1
+ switchport mode access
+ switchport access vlan 10
+ spanning-tree portfast
+```
+
+Repeated this pattern for the rest of the IT endpoints and the other departments' ports.
+
+## 3. Trunking
+
+Infrastructure links between switches are 802.1Q trunks:
+
+```cisco
+interface gigabitEthernet0/1
+ switchport mode trunk
+```
+
+Only the VLANs that actually need to cross each trunk are allowed, and VLAN 999 is set as the native VLAN instead of leaving it on VLAN 1:
+
+```cisco
+interface gigabitEthernet0/1
+ switchport trunk native vlan 999
+ switchport trunk allowed vlan 10,20,30,40,99,999
+ switchport mode trunk
+```
+
+## 4. Multilayer Switch SVIs
+
+Both multilayer switches get an SVI per VLAN, giving each one its own Layer 3 address to route with.
+
+**MSW1:**
+
+```cisco
+interface vlan 10
+ ip address 10.10.10.1 255.255.255.224
+ no shutdown
+
+interface vlan 20
+ ip address 10.10.20.1 255.255.255.240
+ no shutdown
+
+interface vlan 30
+ ip address 10.10.30.1 255.255.255.224
+ no shutdown
+
+interface vlan 40
+ ip address 10.10.40.1 255.255.255.240
+ no shutdown
+
+interface vlan 99
+ ip address 10.10.99.1 255.255.255.240
+ no shutdown
+```
+
+**MSW2:**
+
+```cisco
+interface vlan 10
+ ip address 10.10.10.2 255.255.255.224
+ no shutdown
+
+interface vlan 20
+ ip address 10.10.20.2 255.255.255.240
+ no shutdown
+
+interface vlan 30
+ ip address 10.10.30.2 255.255.255.224
+ no shutdown
+
+interface vlan 40
+ ip address 10.10.40.2 255.255.255.240
+ no shutdown
+
+interface vlan 99
+ ip address 10.10.99.2 255.255.255.240
+ no shutdown
+```
+
+And obviously nothing routes until you actually turn routing on:
+
+```cisco
+ip routing
+```
+
+## 5. HSRP
+
+Virtual gateway addresses, one per VLAN:
+
+```
+VLAN 10 → 10.10.10.3
+VLAN 20 → 10.10.20.3
+VLAN 30 → 10.10.30.3
+VLAN 40 → 10.10.40.3
+VLAN 99 → 10.10.99.3
+```
+
+**MSW1** gets bumped to priority 110 (with preempt) on VLANs 10, 30, and 99 so it wins the active role for those:
+
+```cisco
+interface vlan 10
+ standby 10 ip 10.10.10.3
+ standby 10 priority 110
+ standby 10 preempt
+```
+
+```cisco
+interface vlan 30
+ standby 30 ip 10.10.30.3
+ standby 30 priority 110
+ standby 30 preempt
+```
+
+```cisco
+interface vlan 99
+ standby 99 ip 10.10.99.3
+ standby 99 priority 110
+ standby 99 preempt
+```
+
+It just sits at the default priority of 100 for VLANs 20 and 40, letting MSW2 win those instead.
+
+**MSW2** gets the same treatment in reverse — priority 110 on VLANs 20 and 40:
+
+```cisco
+interface vlan 20
+ standby 20 ip 10.10.20.3
+ standby 20 priority 110
+ standby 20 preempt
+```
+
+```cisco
+interface vlan 40
+ standby 40 ip 10.10.40.3
+ standby 40 priority 110
+ standby 40 preempt
+```
+
+End result: the active gateway role is split across both switches instead of piling onto one.
+
+## 6. EtherChannel
+
+LACP bundle between the two multilayer switches, two physical links each:
+
+**MSW1:**
+
+```cisco
+interface range gigabitEthernet1/0/23-24
+ channel-group 1 mode active
+```
+
+Which shows up as:
+
+```cisco
+interface port-channel1
+```
+
+**MSW2** gets the identical config:
+
+```cisco
+interface range gigabitEthernet1/0/23-24
+ channel-group 1 mode active
+```
+
+Both ends use LACP active mode so they actually negotiate instead of just hoping the config matches. To check it bundled correctly:
+
+```cisco
+show etherchannel summary
+```
+
+You want to see `Po1` with both physical interfaces showing as bundled members.
+
+## 7. Rapid PVST+
+
+```cisco
+spanning-tree mode rapid-pvst
+```
+
+PortFast and BPDU Guard on edge-facing interfaces:
+
+```cisco
+spanning-tree portfast
+spanning-tree bpduguard enable
+```
+
+And globally, so I don't have to remember to add it on every new edge port:
+
+```cisco
+spanning-tree portfast default
+spanning-tree portfast bpduguard default
+```
+
+Checked with:
+
+```cisco
+show spanning-tree
+```
+
+## 8. OSPF
+
+Running OSPF process 1, with each multilayer switch advertising its directly connected networks:
+
+```cisco
+router ospf 1
+ router-id 2.2.2.2
+ network 10.10.10.0 0.0.0.31 area 0
+ network 10.10.20.0 0.0.0.15 area 0
+ network 10.10.30.0 0.0.0.31 area 0
+ network 10.10.40.0 0.0.0.15 area 0
+ network 10.10.99.0 0.0.0.15 area 0
+```
+
+The other multilayer switch runs the same config with its own router ID.
+
+R1 uses router ID `1.1.1.1`, backed by a loopback so its identity in OSPF doesn't depend on any single physical link staying up:
+
+```cisco
+interface loopback1
+ ip address 1.1.1.1 255.255.255.255
+```
+
+To confirm adjacencies actually formed and routes are showing up:
+
+```cisco
+show ip ospf neighbor
+show ip route ospf
+```
+
+Neighbors should reach `FULL` state — if they're stuck at `2-WAY` or `EXSTART`, something's off with MTU or network type, not just a timing issue.
+
+## 9. OSPF Passive Interfaces
+
+Worth calling out since it tripped me up initially: `passive-interface` doesn't stop a network from being advertised — it just stops that interface from sending hellos and forming a neighbor relationship. Useful on VLAN interfaces facing end hosts, where there's no reason to try to form an OSPF adjacency with a workstation.
+
+```cisco
+router ospf 1
+ passive-interface vlan 10
+```
+
+## 10. DHCP
+
+One pool per VLAN. IT, for example:
+
+```cisco
+ip dhcp pool IT
+ network 10.10.10.0 255.255.255.224
+ default-router 10.10.10.3
+```
+
+And HR:
+
+```cisco
+ip dhcp pool HR
+ network 10.10.20.0 255.255.255.240
+ default-router 10.10.20.3
+```
+
+Same pattern for the rest of the VLANs. Excluded the address range used by the SVIs and HSRP virtual IP so DHCP doesn't try to hand those out to a client:
+
+```cisco
+ip dhcp excluded-address 10.10.10.1 10.10.10.3
+```
+
+Checked assignments with:
+
+```cisco
+show ip dhcp binding
+show ip dhcp pool
+```
+
+## 11. Extended ACLs
+
+Blocking HR ↔ Accounting in both directions, permitting everything else:
+
+**HR side:**
+
+```cisco
+ip access-list extended HR-ACL
+ deny ip 10.10.20.0 0.0.0.15 10.10.30.0 0.0.0.31
+ permit ip any any
+```
+
+**Accounting side:**
+
+```cisco
+ip access-list extended ACCOUNTING-ACL
+ deny ip 10.10.30.0 0.0.0.31 10.10.20.0 0.0.0.15
+ permit ip any any
+```
+
+Applied to the relevant SVIs. `show access-lists` is useful here beyond just confirming the rules exist — the match counters tell you whether traffic is actually hitting the deny lines, which is how I caught a couple of early misconfigurations.
+
+## 12. SSH
+
+Needs a hostname and domain name before RSA keys will generate:
+
+```cisco
+hostname MSW1
+ip domain-name enterprise.local
+```
+
+```cisco
+crypto key generate rsa
+```
+
+Local admin account:
+
+```cisco
+username admin privilege 15 secret <password>
+```
+
+VTY lines locked to SSH only — no Telnet fallback:
+
+```cisco
+line vty 0 4
+ login local
+ transport input ssh
+```
+
+Forced SSHv2:
+
+```cisco
+ip ssh version 2
+```
+
+Confirmed with `show ip ssh`, then tested from an actual host:
+
+```
+ssh -l admin <device-ip>
+```
+
+## 13. Management VLAN
+
+VLAN 99 (`10.10.99.0/28`, gateway `10.10.99.3`) is dedicated to device management traffic, kept separate from anything departmental, and carried across the trunks that need it.
+
+## 14. Native VLAN
+
+VLAN 999 is a dummy native VLAN with nothing actually on it — just there so trunk ports aren't defaulting to VLAN 1 as native, which is a common and pretty avoidable weak spot.
+
+```cisco
+vlan 999
+ name NATIVE
+```
+
+```cisco
+switchport trunk native vlan 999
+```
+
+## 15. Port Security
+
+On access ports, locked down to one MAC address with a shutdown violation action:
+
+```cisco
+interface fa0/1
+ switchport mode access
+ switchport access vlan 10
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+```
+
+Checked with `show port-security`.
+
+## 16. Verification Commands I Used Most
+
+```cisco
+show vlan brief
+show interfaces trunk
+show etherchannel summary
+show standby brief
+show ip ospf neighbor
+show ip route ospf
+show ip route
+show ip dhcp binding
+show ip dhcp pool
+show access-lists
+show ip ssh
+show spanning-tree
+show spanning-tree vlan 10
+show ip interface brief
+```
+
+## 17. Things That Actually Went Wrong
+
+**DHCP** — A few hosts got addresses I wasn't expecting at first. Turned out that's just normal DHCP behavior — it hands out whatever's next available in the pool, not a fixed address per host. Checked the bindings to confirm nothing was statically assigned and the pool was working as intended.
+
+**HSRP** — Ran into a virtual IP mismatch between the two switches for one VLAN. Standby groups won't work right if the virtual IP configured on each switch doesn't match exactly — fixed once I double-checked both sides used the same address.
+
+**OSPF** — Spent a bit of time on passive-interface behavior specifically because I initially assumed it would stop a network from being advertised entirely. It doesn't — it just stops that interface from forming adjacencies, which is a meaningful distinction once you're trying to control exactly which interfaces should be neighboring.
+
+**ACLs** — First round of testing gave connectivity results I didn't expect. Traced it back to a combination of ACL rule order and host addressing, not the ACL logic itself. Fixed and re-tested until the restrictions matched what was actually intended.
+
+**Redundancy** — HSRP, EtherChannel, OSPF, and Rapid PVST+ were all tested by intentionally killing a link or interface, not just assumed to be working because the initial config looked right.
+
+## 18. What Got Verified
+
+By the end, I'd confirmed VLAN segmentation, trunking, inter-VLAN routing, HSRP failover, EtherChannel bundling, Rapid PVST+, OSPF adjacencies and routing, DHCP assignment, ACL enforcement, SSH access, port security, and failover behavior under simulated failure — not just under normal conditions.
+
+## 19. Notes
+
+This doc covers the major pieces, but the full device configs and topology live in the actual Packet Tracer file:
+
+`Network-Enterprise.pkt`
